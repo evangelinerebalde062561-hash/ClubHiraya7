@@ -12,6 +12,8 @@
     <script defer src="js/settings-sync.js"></script>
     <script defer src="js/app.js"></script>
     <script defer src="js/tables-select.js"></script>
+    <script defer src="js/app-actions.js"></script>
+    <script defer src="js/app-payments.js"></script>
 </head>
 <body<?php if (isset($_SESSION['dark_mode']) && $_SESSION['dark_mode']) echo ' class="dark-mode"'; ?>>
 

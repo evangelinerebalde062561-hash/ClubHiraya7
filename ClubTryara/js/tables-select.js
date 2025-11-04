@@ -1,24 +1,197 @@
 /**
  * tables-select.js (event-delegation version)
- * - Same as previous but with improved error/debug handling when fetch fails.
+ * - Persists selected table (and price) in sessionStorage
+ * - Emits 'reserved-price-changed' event when selection changes so the app can re-render totals immediately
+ * - Hardened MutationObserver to avoid feedback loops
+ *
+ * Changes:
+ * 1) Do not reapply persisted selection on a page "reload". We detect navigation reloads
+ *    and clear the stored selection so it does not survive Ctrl+F5 / page reloads.
+ *    (We still persist selection during normal in-app interactions so it survives UI re-renders.)
+ * 2) When a table is selected and the summary is shown, hide the "Choose table" button (#open-tables-btn).
+ *    When the selection is cleared the Choose button is re-shown.
+ *
+ * Note: We use the Navigation Timing API to detect reload navigation (performance.getEntriesByType('navigation')[0].type === 'reload').
+ * This will clear persisted selection on any reload (including Ctrl+F5).
  */
 
 (function () {
   let selectedTable = null;
   let observer = null;
+  const STORAGE_KEY = 'clubtryara:selected_table_v1';
+
+  function persistSelectedTable(table) {
+    try {
+      if (!table) {
+        sessionStorage.removeItem(STORAGE_KEY);
+        return;
+      }
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(table));
+    } catch (err) {
+      console.warn('Failed to persist selected table', err);
+    }
+  }
+
+  function restoreSelectedTable() {
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('Failed to parse persisted selected table', err);
+      return null;
+    }
+  }
+
+  function clearPersistedOnReloadIfNeeded() {
+    try {
+      // Use Navigation Timing Level 2 when available
+      const navEntries = performance.getEntriesByType && performance.getEntriesByType('navigation');
+      const navType = Array.isArray(navEntries) && navEntries[0] && navEntries[0].type
+        ? navEntries[0].type
+        : (performance.navigation && performance.navigation.type === 1 ? 'reload' : '');
+
+      // If navigation type is 'reload' then clear persisted selection so it won't survive Ctrl+F5/hard reload.
+      if (navType === 'reload') {
+        sessionStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (e) {
+      // ignore errors, do nothing
+    }
+  }
+
+  function emitReservedPriceChanged() {
+    try {
+      const ev = new CustomEvent('reserved-price-changed', { detail: { price: parseFloat(document.body.dataset.reservedTablePrice || 0) || 0 } });
+      window.dispatchEvent(ev);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  // create the summary node (returns the element)
+  function createSummaryNode() {
+    const summary = document.createElement('div');
+    summary.id = 'selected-table-summary';
+    summary.style.display = 'none';
+    summary.style.marginTop = '8px';
+    summary.style.fontSize = '13px';
+
+    summary.innerHTML =
+      'Selected table: <strong id="selected-table-name">—</strong> (Party size: <span id="selected-table-party">—</span>, Price: ₱<span id="selected-table-price">0.00</span>)';
+
+    // Clear button (created here so handler can be attached or replaced)
+    const clearBtn = document.createElement('button');
+    clearBtn.type = 'button';
+    clearBtn.id = 'clear-selected-table';
+    clearBtn.className = 'btn-link';
+    clearBtn.style.marginLeft = '8px';
+    clearBtn.textContent = 'Clear';
+    summary.appendChild(clearBtn);
+
+    return summary;
+  }
+
+  // ensure Clear button has handler (idempotent)
+  function ensureClearHandler() {
+    const clearBtn = document.getElementById('clear-selected-table');
+    if (!clearBtn) return;
+    // remove previous duplicate handlers by replacing the node with a clone
+    const clone = clearBtn.cloneNode(true);
+    clearBtn.parentNode.replaceChild(clone, clearBtn);
+    clone.addEventListener('click', () => {
+      clearSelectedTable();
+    });
+  }
+
+  // helper: show/hide choose button
+  function setChooseButtonVisible(visible) {
+    const chooseBtn = document.getElementById('open-tables-btn');
+    if (!chooseBtn) return;
+    chooseBtn.style.display = visible ? '' : 'none';
+  }
 
   function ensureReservedUI() {
-    if (document.getElementById('use-reserved-table')) return;
-
     const orderCompute = document.getElementById('orderCompute') || document.querySelector('.order-compute');
     const orderSection = document.querySelector('.order-section');
     if (!orderCompute && !orderSection) return;
 
-    const reservedBlock = document.createElement('div');
+    // If reserved-block exists, make sure its inner pieces (summary, clear) exist and handlers attached
+    let reservedBlock = document.querySelector('.reserved-table-block');
+    if (reservedBlock) {
+      // ensure checkbox exists
+      let checkbox = document.getElementById('use-reserved-table');
+      if (!checkbox) {
+        // try to find a label to insert into, otherwise prepend
+        checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.id = 'use-reserved-table';
+        checkbox.setAttribute('aria-controls', 'tablesModal');
+        // best-effort: append to first label inside reservedBlock if exists
+        const lbl = reservedBlock.querySelector('.reserved-checkbox-label');
+        if (lbl) lbl.insertBefore(checkbox, lbl.firstChild);
+        else {
+          const newLabel = document.createElement('label');
+          newLabel.className = 'reserved-checkbox-label';
+          newLabel.style.display = 'flex';
+          newLabel.style.alignItems = 'center';
+          newLabel.style.gap = '8px';
+          const span = document.createElement('span');
+          span.textContent = 'Customer has a reserved table';
+          newLabel.appendChild(checkbox);
+          newLabel.appendChild(span);
+          reservedBlock.insertBefore(newLabel, reservedBlock.firstChild.nextSibling);
+        }
+      }
+      // ensure choose button exists
+      let chooseBtn = document.getElementById('open-tables-btn');
+      if (!chooseBtn) {
+        chooseBtn = document.createElement('button');
+        chooseBtn.type = 'button';
+        chooseBtn.id = 'open-tables-btn';
+        chooseBtn.className = 'btn-small';
+        chooseBtn.textContent = 'Choose table';
+        chooseBtn.disabled = true;
+        chooseBtn.style.marginTop = '8px';
+        reservedBlock.appendChild(chooseBtn);
+      }
+      // ensure summary exists
+      let summary = document.getElementById('selected-table-summary');
+      if (!summary) {
+        summary = createSummaryNode();
+        reservedBlock.appendChild(summary);
+      } else {
+        // ensure Clear button present
+        if (!document.getElementById('clear-selected-table')) {
+          const clearBtn = document.createElement('button');
+          clearBtn.type = 'button';
+          clearBtn.id = 'clear-selected-table';
+          clearBtn.className = 'btn-link';
+          clearBtn.style.marginLeft = '8px';
+          clearBtn.textContent = 'Clear';
+          summary.appendChild(clearBtn);
+        }
+      }
+      // attach clear handler safely
+      ensureClearHandler();
+      return;
+    }
+
+    // If we reached here, reservedBlock is missing -> build it fresh
+    reservedBlock = document.createElement('div');
     reservedBlock.className = 'reserved-table-block';
     reservedBlock.style.padding = '8px';
     reservedBlock.style.borderBottom = '1px solid rgba(0,0,0,0.05)';
     reservedBlock.style.boxSizing = 'border-box';
+
+    // Title above the compute area
+    const title = document.createElement('div');
+    title.id = 'reserved-table-title';
+    title.textContent = 'Reserved Table';
+    title.style.fontSize = '13px';
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '6px';
+    reservedBlock.appendChild(title);
 
     const label = document.createElement('label');
     label.className = 'reserved-checkbox-label';
@@ -47,23 +220,7 @@
     chooseBtn.style.marginTop = '8px';
     reservedBlock.appendChild(chooseBtn);
 
-    const summary = document.createElement('div');
-    summary.id = 'selected-table-summary';
-    summary.style.display = 'none';
-    summary.style.marginTop = '8px';
-    summary.style.fontSize = '13px';
-
-    summary.innerHTML =
-      'Selected table: <strong id="selected-table-name">—</strong> (Table <span id="selected-table-number">—</span>, Party size: <span id="selected-table-party">—</span>, Price: ₱<span id="selected-table-price">0.00</span>)';
-
-    const clearBtn = document.createElement('button');
-    clearBtn.type = 'button';
-    clearBtn.id = 'clear-selected-table';
-    clearBtn.className = 'btn-link';
-    clearBtn.style.marginLeft = '8px';
-    clearBtn.textContent = 'Clear';
-    summary.appendChild(clearBtn);
-
+    const summary = createSummaryNode();
     reservedBlock.appendChild(summary);
 
     if (orderCompute) {
@@ -82,13 +239,15 @@
       }
     }
 
+    // attach Clear handler
+    ensureClearHandler();
+
+    // checkbox change handler
     checkbox.addEventListener('change', () => {
       if (checkbox.checked) {
         chooseBtn.disabled = false;
         const tablesLoading = document.getElementById('tables-loading');
         if (tablesLoading) tablesLoading.style.display = '';
-        // prefetch available/reserved tables so modal is ready
-        // we request available tables by default (server supports ?type=available)
         fetchTables(true)
           .then((data) => {
             renderTablesToModal(data);
@@ -185,12 +344,8 @@
     tablesModal.classList.add('hidden');
   }
 
-  // Improved fetch with timeout and better fallbacks
   function fetchTables(useReserved) {
     const base = 'tables/get_reserved_tables.php';
-    // When checkbox is checked we want to show available tables by default.
-    // Map useReserved param: if true we will request 'available' (so it shows seats).
-    // If you want reserved-only behavior, change mapping.
     const type = useReserved ? 'available' : 'reserved';
     const url = base + '?type=' + encodeURIComponent(type);
 
@@ -201,11 +356,9 @@
         .finally(() => clearTimeout(id));
     }
 
-    // Try primary request (with timeout), then fallback to ?type=all
     return fetchWithTimeout(url, { method: 'GET', credentials: 'same-origin' }, 8000)
       .then(async (r) => {
         if (!r.ok) {
-          // fallback: try all
           const fall = await fetchWithTimeout(base + '?type=all', { method: 'GET', credentials: 'same-origin' }, 8000).catch(() => null);
           if (fall && fall.ok) return fall.json();
           const txt = await r.text().catch(() => '');
@@ -217,7 +370,6 @@
         try {
           return JSON.parse(text || '[]');
         } catch (err) {
-          // fallback: try all
           const fall = await fetchWithTimeout(base + '?type=all', { method: 'GET', credentials: 'same-origin' }, 8000).catch(() => null);
           if (fall && fall.ok) return fall.json();
           const e = new Error('Invalid JSON from server');
@@ -242,8 +394,23 @@
       });
   }
 
+  function applyTablePriceToComputation(price, opts = {}) {
+    try {
+      if (opts.clear) {
+        document.body.dataset.reservedTablePrice = 0;
+      } else {
+        document.body.dataset.reservedTablePrice = price;
+      }
+      emitReservedPriceChanged();
+    } catch (err) {
+      console.error('applyTablePriceToComputation error', err);
+    }
+  }
+
   function applySelectedTable(table) {
     selectedTable = table;
+
+    ensureReservedUI();
 
     const selectedName = document.getElementById('selected-table-name');
     const selectedNumber = document.getElementById('selected-table-number');
@@ -254,7 +421,7 @@
     const openBtn = document.getElementById('open-tables-btn');
 
     if (selectedName) selectedName.textContent = table.name || '—';
-    if (selectedNumber) selectedNumber.textContent = table.table_number || table.id || '—';
+    if (selectedNumber) selectedNumber.textContent = table.table_number || table.id || '';
     if (selectedParty) selectedParty.textContent = table.party_size || '—';
     if (selectedPriceEl) selectedPriceEl.textContent = (parseFloat(table.price) || 0).toFixed(2);
     if (selectedSummary) selectedSummary.style.display = '';
@@ -262,15 +429,21 @@
     if (checkbox && !checkbox.checked) checkbox.checked = true;
     if (openBtn) openBtn.disabled = false;
 
+    // hide choose button while a selection is visible
+    setChooseButtonVisible(false);
+
+    persistSelectedTable(table);
+
     const ev = new CustomEvent('table-selected', { detail: table });
     window.dispatchEvent(ev);
 
-    document.body.dataset.reservedTablePrice = (parseFloat(table.price) || 0);
     applyTablePriceToComputation(parseFloat(table.price) || 0);
   }
 
   function clearSelectedTable() {
     selectedTable = null;
+    ensureReservedUI();
+
     const selectedName = document.getElementById('selected-table-name');
     const selectedNumber = document.getElementById('selected-table-number');
     const selectedParty = document.getElementById('selected-table-party');
@@ -285,38 +458,18 @@
     if (selectedPriceEl) selectedPriceEl.textContent = '0.00';
     if (selectedSummary) selectedSummary.style.display = 'none';
 
+    // show choose button again
+    setChooseButtonVisible(true);
+
     const ev = new CustomEvent('table-cleared');
     window.dispatchEvent(ev);
 
-    document.body.dataset.reservedTablePrice = 0;
     applyTablePriceToComputation(0, { clear: true });
 
     if (checkbox) checkbox.checked = false;
     if (openBtn) openBtn.disabled = true;
-  }
 
-  function applyTablePriceToComputation(price, opts = {}) {
-    try {
-      if (typeof window.applyReservedTablePrice === 'function') {
-        if (opts.clear) window.applyReservedTablePrice(null);
-        else window.applyReservedTablePrice(price);
-        return;
-      }
-
-      if (typeof window.recomputeTotals === 'function') {
-        if (opts.clear) window.recomputeTotals({ reservedTablePrice: 0, clearReserved: true });
-        else window.recomputeTotals({ reservedTablePrice: price });
-        return;
-      }
-
-      if (typeof window.renderOrder === 'function') {
-        if (opts.clear) document.body.dataset.reservedTablePrice = 0;
-        else document.body.dataset.reservedTablePrice = price;
-        window.renderOrder();
-      }
-    } catch (err) {
-      console.error('applyTablePriceToComputation error', err);
-    }
+    persistSelectedTable(null);
   }
 
   function delegatedClickHandler(e) {
@@ -340,7 +493,6 @@
         .then((data) => renderTablesToModal(data))
         .catch((err) => {
           console.error('Failed to fetch tables', err);
-          // fetchTables already wrote useful info into tables-loading; keep modal open so user can see it
         });
       return;
     }
@@ -375,18 +527,82 @@
     }
   }
 
+  // Hardened observer: debounce, ignore modal/reserved UI mutations, cooldown reapply
   function setupObserver() {
     if (observer) return;
     const orderSection = document.querySelector('.order-section');
     if (!orderSection) return;
 
-    observer = new MutationObserver(() => {
-      ensureReservedUI();
+    let debounceId = null;
+    let lastAppliedAt = 0;
+    const DEBOUNCE_MS = 100;
+    const REAPPLY_COOLDOWN_MS = 500;
+
+    observer = new MutationObserver((mutationsList) => {
+      if (debounceId) clearTimeout(debounceId);
+      debounceId = setTimeout(() => {
+        debounceId = null;
+        try {
+          const hasRelevant = mutationsList.some((m) => {
+            const target = m.target;
+            if (!target) return true;
+            if (target.closest && (target.closest('#tablesModal') || target.closest('.reserved-table-block'))) {
+              return false;
+            }
+            for (let i = 0; i < (m.addedNodes?.length || 0); i++) {
+              const n = m.addedNodes[i];
+              if (n && n.closest && (n.closest('#tablesModal') || n.closest('.reserved-table-block'))) {
+                return false;
+              }
+            }
+            return true;
+          });
+
+          if (!hasRelevant) return;
+
+          ensureReservedUI();
+
+          const now = Date.now();
+          if (now - lastAppliedAt < REAPPLY_COOLDOWN_MS) return;
+
+          const persisted = restoreSelectedTable();
+          if (persisted) {
+            selectedTable = persisted;
+            const selectedName = document.getElementById('selected-table-name');
+            const selectedNumber = document.getElementById('selected-table-number');
+            const selectedParty = document.getElementById('selected-table-party');
+            const selectedPriceEl = document.getElementById('selected-table-price');
+            const selectedSummary = document.getElementById('selected-table-summary');
+            const checkbox = document.getElementById('use-reserved-table');
+            const openBtn = document.getElementById('open-tables-btn');
+
+            if (selectedName) selectedName.textContent = persisted.name || '—';
+            if (selectedNumber) selectedNumber.textContent = persisted.table_number || persisted.id || '—';
+            if (selectedParty) selectedParty.textContent = persisted.party_size || '—';
+            if (selectedPriceEl) selectedPriceEl.textContent = (parseFloat(persisted.price) || 0).toFixed(2);
+            if (selectedSummary) selectedSummary.style.display = '';
+
+            if (checkbox && !checkbox.checked) checkbox.checked = true;
+            if (openBtn) openBtn.disabled = false;
+
+            document.body.dataset.reservedTablePrice = (parseFloat(persisted.price) || 0);
+            emitReservedPriceChanged();
+          }
+
+          lastAppliedAt = Date.now();
+        } catch (err) {
+          console.error('observer handler error', err);
+        }
+      }, DEBOUNCE_MS);
     });
+
     observer.observe(orderSection, { childList: true, subtree: true });
   }
 
   function init() {
+    // Clear persisted selection if this page load is a reload (so it won't survive Ctrl+F5/hard refresh)
+    clearPersistedOnReloadIfNeeded();
+
     ensureReservedUI();
     document.removeEventListener('click', delegatedClickHandler);
     document.addEventListener('click', delegatedClickHandler);
@@ -394,6 +610,34 @@
       if (ev.key === 'Escape') hideModal();
     });
     setupObserver();
+
+    const persisted = restoreSelectedTable();
+    if (persisted) {
+      ensureReservedUI();
+      selectedTable = persisted;
+      const selectedName = document.getElementById('selected-table-name');
+      const selectedNumber = document.getElementById('selected-table-number');
+      const selectedParty = document.getElementById('selected-table-party');
+      const selectedPriceEl = document.getElementById('selected-table-price');
+      const selectedSummary = document.getElementById('selected-table-summary');
+      const checkbox = document.getElementById('use-reserved-table');
+      const openBtn = document.getElementById('open-tables-btn');
+
+      if (selectedName) selectedName.textContent = persisted.name || '—';
+      if (selectedNumber) selectedNumber.textContent = persisted.table_number || persisted.id || '—';
+      if (selectedParty) selectedParty.textContent = persisted.party_size || '—';
+      if (selectedPriceEl) selectedPriceEl.textContent = (parseFloat(persisted.price) || 0).toFixed(2);
+      if (selectedSummary) selectedSummary.style.display = '';
+
+      if (checkbox && !checkbox.checked) checkbox.checked = true;
+      if (openBtn) openBtn.disabled = false;
+
+      // hide choose button while persisted selection is applied on this load
+      setChooseButtonVisible(false);
+
+      document.body.dataset.reservedTablePrice = (parseFloat(persisted.price) || 0);
+      emitReservedPriceChanged();
+    }
   }
 
   if (document.readyState === 'loading') {
